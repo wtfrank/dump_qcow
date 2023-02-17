@@ -1,5 +1,5 @@
 use anyhow::*;
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, NativeEndian, ReadBytesExt};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Read;
@@ -15,6 +15,7 @@ struct QcowHeader {
     crypt_method: CryptMethod,
     l1_table: Vec<L1Entry>,
     refcount_table_offset: u64,
+    refcount_table_clusters: u32,
     nb_snapshots: u32,
     snapshots_offset: u64,
 
@@ -25,6 +26,12 @@ struct QcowHeader {
     refcount_bits: u32,
 
     extended_l2_entries: bool,
+}
+
+impl QcowHeader {
+    pub fn cluster_size(&self) -> u64 {
+        return 1_u64 << self.cluster_bits;
+    }
 }
 
 impl std::fmt::Display for QcowHeader {
@@ -114,28 +121,43 @@ fn load_header(buf: &mut BufReader<File>) -> anyhow::Result<QcowHeader> {
     header.crypt_method = CryptMethod::Unencrypted;
 
     let l1_size = buf.read_u32::<BigEndian>()?;
+
+    //check that l1_size matches the size of the disc
+    let l2_virtual_coverage = header.cluster_size()/8 * header.cluster_size();
+    //println!("file size is {} while cluster table coverage is {}", header.size, l2_virtual_coverage * l1_size as u64);
+    assert_eq!(l1_size, ((header.size + l2_virtual_coverage -1) / l2_virtual_coverage) as u32 );
+
+
     let l1_offset = buf.read_u64::<BigEndian>()?;
+    // must be aligned to a cluster boundary
+    assert_eq!(l1_offset % header.cluster_size(), 0);
     seek_save(buf, &mut |b| {
         b.seek(SeekFrom::Start(l1_offset))?;
-        for _ in (l1_offset..(l1_offset + l1_size as u64)).step_by(8) {
+        for _ in (l1_offset..(l1_offset + (l1_size*8) as u64)).step_by(8) {
             let entry = b.read_u64::<BigEndian>()?;
             let refcount1 = entry & (1 << 63) != 0;
-            let offset = (entry >> 9) & 0x3fff_ffff_ffff;
+            let offset = entry & 0xff_ffff_ffff_fe00;
             header.l1_table.push(L1Entry { offset, refcount1 });
         }
         Ok(())
     })?;
+    assert_eq!(header.l1_table.len(), l1_size as usize);
 
     header.refcount_table_offset = buf.read_u64::<BigEndian>()?;
+    header.refcount_table_clusters = buf.read_u32::<BigEndian>()?;
     header.nb_snapshots = buf.read_u32::<BigEndian>()?;
     header.snapshots_offset = buf.read_u64::<BigEndian>()?;
 
+    /* v2 header should end at a multiple of 8 bytes */
+    assert_eq!(0, buf.stream_position()? % 8);
     if header.version >= 3 {
         load_v3_header(&mut header, buf)?;
     } else {
         header.refcount_bits = 16;
     }
 
+    /* v3 header should end at a multiple of 8 bytes */
+    assert_eq!(0, buf.stream_position()? % 8);
     load_header_extensions(&mut header, buf)?;
 
     Ok(header)
@@ -205,6 +227,7 @@ fn load_header_extensions(
     _header: &mut QcowHeader,
     buf: &mut BufReader<File>,
 ) -> anyhow::Result<()> {
+    println!("header extensions starting at {}", buf.stream_position()?);
     loop {
         let extension_type_data = buf.read_u32::<BigEndian>()?;
         let extension_type = match extension_type_data {
@@ -217,10 +240,20 @@ fn load_header_extensions(
             _ => HeaderExtension::Unknown,
         };
 
+        match extension_type {
+            HeaderExtension::EndOfExtensions => {
+                println!("end of extensions at {}", buf.stream_position()?);
+                break;
+            },
+            _ => {
+                println!("extension header {extension_type:?}");
+            }
+        };
+
         let length = buf.read_u32::<BigEndian>()?;
         if length > 0 {
             println!("extension header {extension_type:?} {extension_type_data} length {length}");
-            let mut buf2 = vec![0_u8; length as usize];
+            //let mut buf2 = vec![0_u8; length as usize];
             //buf.read_exact(&mut buf2[0..(length as usize)])?;
             buf.seek_relative(length as i64)?;
 
@@ -230,15 +263,51 @@ fn load_header_extensions(
             }
         }
 
-        match extension_type {
-            HeaderExtension::EndOfExtensions => {
-                println!("end of extensions");
-                break;
+    }
+
+    Ok(())
+}
+
+fn dump_l2_info(header: &QcowHeader, buf: &mut BufReader<File>) -> anyhow::Result<()>
+{
+    let l2eperc = header.cluster_size()/8;
+    let mut virt_offset = 0;
+    for l1 in &header.l1_table {
+      if l1.offset == 0 {
+        println!("empty l2 table: covering virt offset 0x{:X}-0x{:x}", virt_offset, virt_offset+l2eperc*header.cluster_size() );
+        virt_offset += l2eperc * header.cluster_size();
+        continue;
+      }
+      println!("l2 table: {} with {} entries, covering virt offset 0x{:x}-0x{:x}", l1.offset, l2eperc, virt_offset, virt_offset+l2eperc*header.cluster_size() );
+      buf.seek(SeekFrom::Start(l1.offset))?;
+      for _ in (0..header.cluster_size()).step_by(8) {
+          let l2 = buf.read_u64::<BigEndian>()?;
+          let comp = l2 & (1 << 62) != 0;
+          let rc1 = l2 & (1 << 63) != 0;
+          if comp {
+             println!("virt offset 0x{virt_offset:x} is a compressed cluster - not handled");
+             virt_offset += header.cluster_size();
+             continue;
+          }
+
+          let scd = l2 & 0x3fff_ffff_ffff_ffff;
+          let all_zeros = scd & 0x1 != 0;
+          let host_cluster_offset = scd & 0xff_ffff_ffff_fe00;
+          if all_zeros {
+            println!("virt offset 0x{virt_offset:x} is all zeros");
+            virt_offset += header.cluster_size();
+            continue;
+          }
+          if host_cluster_offset == 0 {
+            if rc1 {
+              println!("standard/rc1 but set with a host offset of 0 while no external file in use");
             }
-            _ => {
-                println!("extension header {extension_type:?}");
-            }
-        };
+            virt_offset += header.cluster_size();
+            continue;
+          }
+          println!("virt offset 0x{virt_offset:x} at host offset: 0x{host_cluster_offset:x} (scd=0x{scd:x})");
+          virt_offset += header.cluster_size();
+      }
     }
 
     Ok(())
@@ -251,6 +320,8 @@ pub fn dump(path: std::path::PathBuf) -> anyhow::Result<()> {
     let header = load_header(&mut buf)?;
 
     println!("{header}");
+
+    dump_l2_info(&header, &mut buf)?;
 
     Ok(())
 }
